@@ -1,11 +1,18 @@
 """
-Script Generation Module for VoiceVerse Sprint
-Generates structured spoken-word scripts from retrieved context.
-Supports multiple output styles: podcast, debate, storytelling, news, lecture.
+Script Generation Module for VoiceVerse
+=========================================
+Supports three selectable HF models:
+  - Qwen/Qwen3-0.6B             (Fast, no auth)
+  - meta-llama/Llama-3.1-8B-Instruct  (High Quality, gated — needs HF_TOKEN)
+  - openai-community/gpt2       (Baseline, no auth)
+
+Five config parameters drive script structure + audio conditioning:
+  style / tone / length / complexity / delivery intensity
 """
 
+import os
 import re
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 
 # ── Style Configurations ──────────────────────────────────────────────────────
@@ -49,271 +56,393 @@ STYLE_CONFIG = {
 }
 
 
-# ── Prompt Templates ──────────────────────────────────────────────────────────
+# ── Audio Conditioning Prompt (from 5 params) ─────────────────────────────────
 
-def build_prompt(style: str, context: str, topic: str = "") -> str:
-    """Build the LLM prompt based on style."""
-    topic_line = f'The topic/title is: "{topic}".' if topic else ""
+def build_audio_conditioning_prompt(params: Dict) -> str:
+    """
+    Build the internal audio-conditioning string from the five config parameters.
+    PRD §6.6: 'Generate energetic podcast narration with powerful delivery...'
+    """
+    style = params.get("style", "").split(" ")[0].lower()
+    tone = params.get("tone", "Balanced").split(" ")[0].lower()
+    length = params.get("length", "Medium").split(" ")[0].lower()
+    complexity = params.get("complexity", "Intermediate").split(" ")[0].lower()
+    intensity = params.get("intensity", "Balanced").split(" ")[0].lower()
 
-    prompts = {
-        "podcast": f"""You are a podcast script writer. Create an engaging podcast episode script.
+    # Map UI values → audio descriptors
+    tone_map = {
+        "calm": "calm, measured",
+        "energetic": "energetic, upbeat",
+        "serious": "serious, deliberate",
+        "dramatic": "dramatic, expressive",
+    }
+    intensity_map = {
+        "soft": "soft, gentle delivery",
+        "balanced": "balanced, clear delivery",
+        "powerful": "powerful, assertive delivery",
+    }
+    length_map = {
+        "short": "concise narration",
+        "medium": "moderate-length narration",
+        "detailed": "detailed, thorough narration",
+    }
+    complexity_map = {
+        "beginner": "simple vocabulary, easy to follow",
+        "intermediate": "moderate vocabulary, clear articulation",
+        "advanced": "advanced vocabulary, precise articulation",
+    }
+
+    tone_desc = tone_map.get(tone, "balanced")
+    intensity_desc = intensity_map.get(intensity, "balanced delivery")
+    length_desc = length_map.get(length, "moderate narration")
+    complexity_desc = complexity_map.get(complexity, "clear articulation")
+
+    return (
+        f"Generate {tone_desc} {style} narration with {intensity_desc}. "
+        f"{length_desc.capitalize()}. {complexity_desc.capitalize()}. "
+        f"Expressive but professional."
+    )
+
+
+# ── Word Count Target from Length Param ───────────────────────────────────────
+
+def _length_to_words(length_str: str) -> int:
+    l = length_str.lower()
+    if "short" in l or "1 min" in l:
+        return 150
+    elif "detailed" in l or "5+" in l:
+        return 500
+    else:
+        return 250  # medium / 3 min
+
+
+def _complexity_to_vocab(complexity_str: str) -> str:
+    c = complexity_str.lower()
+    if "beginner" in c:
+        return "Use simple words and short sentences. Avoid jargon."
+    elif "advanced" in c:
+        return "Use precise, domain-specific vocabulary. Assume a knowledgeable audience."
+    else:
+        return "Use clear language with some technical terms. Define key concepts briefly."
+
+
+def _tone_instruction(tone_str: str) -> str:
+    t = tone_str.lower()
+    if "calm" in t:
+        return "Speak calmly and steadily. Measured pacing."
+    elif "energetic" in t:
+        return "Be enthusiastic and lively! High energy throughout."
+    elif "serious" in t:
+        return "Maintain a serious, professional demeanor throughout."
+    elif "dramatic" in t:
+        return "Use dramatic pauses and vivid language for emotional impact."
+    return "Keep a balanced, engaging tone."
+
+
+# ── Prompt Builder (style + context + 5 params) ────────────────────────────────
+
+ANTI_HALLUCINATION = (
+    "IMPORTANT: Only use information from the retrieved content below. "
+    "If information is not present in the retrieved content, say so clearly. "
+    "Do NOT add facts or details not present in the source material."
+)
+
+def build_prompt_with_params(
+    style: str,
+    context: str,
+    topic: str = "",
+    params: Dict = None,
+) -> str:
+    """Build the full LLM prompt incorporating all 5 config parameters."""
+    if params is None:
+        params = {}
+
+    topic_line = f'Topic/Title: "{topic}".' if topic else ""
+    word_count = _length_to_words(params.get("length", "Medium"))
+    vocab_instruction = _complexity_to_vocab(params.get("complexity", "Intermediate"))
+    tone_instruction = _tone_instruction(params.get("tone", "Energetic"))
+    intensity = params.get("intensity", "Balanced 🔉").split(" ")[0]
+
+    style_instructions = {
+        "podcast": f"""You are a podcast script writer. Write an engaging podcast script.
+
+{ANTI_HALLUCINATION}
 
 {topic_line}
 
-Source material (use this as your knowledge base, stay grounded in it):
+Retrieved Knowledge (base your script ONLY on this):
+---
 {context}
+---
 
-Write a podcast script with TWO hosts: "Host A" and "Host B".
-Structure:
-- INTRO (Host A introduces topic, Host B adds excitement) 
-- BODY (3-4 exchanges where hosts discuss key points from the material, ask questions, share insights)
-- OUTRO (Host A summarizes takeaways, Host B closes with a call to action)
+Write a podcast with TWO hosts: [Host A] and [Host B].
 
-Format each line as:
-[Host A]: <text>
-[Host B]: <text>
+Required structure:
+INTRO: [Host A] introduces the topic. [Host B] adds excitement.
+BODY: 3–4 exchanges discussing key points from the material.
+CONCLUSION: [Host A] summarizes. [Host B] closes with a call to action.
 
-Keep it natural, engaging, and grounded in the source material. Avoid jargon. 150-250 words total.""",
+Format every line as:
+[Host A]: <spoken text>
+[Host B]: <spoken text>
 
-        "debate": f"""You are a debate script writer. Create a structured academic debate.
+Style instructions: {tone_instruction} {vocab_instruction}
+Delivery: {intensity} intensity.
+Target length: ~{word_count} words total. No bullet points. Conversational flow.""",
+
+        "debate": f"""You are a debate script writer. Write a structured debate.
+
+{ANTI_HALLUCINATION}
 
 {topic_line}
 
-Source material (base arguments on this):
+Retrieved Knowledge (base arguments ONLY on this):
+---
 {context}
+---
 
-Write a debate with TWO speakers:
-- "Speaker 1 (Pro)": argues FOR the main thesis
-- "Speaker 2 (Con)": argues AGAINST or offers an alternative view
+Debate structure with TWO speakers:
+- [Speaker 1 (Pro)]: argues FOR the main thesis
+- [Speaker 2 (Con)]: argues AGAINST or alternative view
 
-Structure:
-- OPENING STATEMENTS (each speaker 2-3 sentences)
-- MAIN ARGUMENT ROUND (2 exchanges each, with evidence from the source)
-- REBUTTAL (each speaker addresses the other's point)
-- CLOSING STATEMENTS (each speaker concludes)
+Required structure:
+OPENING STATEMENTS (2–3 sentences each)
+MAIN ARGUMENT (2 exchanges each with evidence from source)
+REBUTTAL (each addresses the other's point)
+CLOSING STATEMENTS (each concludes)
 
-Format each line as:
+Format:
 [Speaker 1 (Pro)]: <text>
 [Speaker 2 (Con)]: <text>
 
-Be persuasive, use evidence from the source, 200-300 words total.""",
+Style: {tone_instruction} {vocab_instruction} Delivery intensity: {intensity}.
+Target: ~{word_count} words total. No bullet lists.""",
 
-        "storytelling": f"""You are a storytelling narrator. Transform this material into an engaging story.
+        "storytelling": f"""You are a narrative storyteller. Transform this material into a vivid story.
 
-{topic_line}
-
-Source material:
-{context}
-
-Write a narrative story based on the concepts or events in the source material.
-Structure:
-- OPENING: Set the scene dramatically
-- JOURNEY: Walk through the key ideas as a narrative journey
-- CLIMAX: The central insight or discovery
-- RESOLUTION: What this means for the listener
-
-Write as a single narrator. Use vivid language, metaphors, and a story arc.
-Format as continuous prose with clear paragraph breaks.
-150-250 words total.""",
-
-        "news": f"""You are a professional news anchor. Report on this topic as a news broadcast.
+{ANTI_HALLUCINATION}
 
 {topic_line}
 
-Source material (treat as your briefing notes):
+Retrieved Knowledge (source material):
+---
 {context}
+---
 
-Write a news broadcast script for a SINGLE ANCHOR.
-Structure:
-- HEADLINE: One impactful sentence
-- LEAD: Who, What, When, Where, Why in 2-3 sentences
-- DETAILS: Key facts and context from the source (3-4 sentences)
-- EXPERT CONTEXT: What this means (2-3 sentences)
-- SIGN-OFF: Professional closing
+Write as a single Narrator. Required structure:
+INTRO: Hook and topic introduction
+BODY: Grounded explanation and narrative journey through the key ideas
+CONCLUSION: Summary, key takeaway, and closing line
 
-Keep it factual, clear, and authoritative. 150-200 words total.
-Format as continuous speech (no [labels]).""",
+Style: {tone_instruction} Use vivid language and metaphors. {vocab_instruction}
+Delivery intensity: {intensity}. Target: ~{word_count} words. Continuous prose, paragraph breaks only.""",
 
-        "lecture": f"""You are a university professor. Deliver a clear educational lecture on this topic.
+        "news": f"""You are a professional news anchor. Broadcast this as a news report.
+
+{ANTI_HALLUCINATION}
 
 {topic_line}
 
-Source material (your lecture notes):
+Briefing notes (ONLY use this):
+---
 {context}
+---
 
-Write a lecture script for a SINGLE PROFESSOR.
-Structure:
-- WELCOME & OBJECTIVES: What students will learn today
-- CONCEPT 1: First key idea with explanation and example
-- CONCEPT 2: Second key idea building on the first
-- CONCEPT 3: Third key idea or application
-- SUMMARY & TAKEAWAY: Recap and why it matters
+Write for a SINGLE Anchor. Required structure:
+INTRO: Hook and topic introduction
+BODY: Key facts, context, and what this means
+CONCLUSION: Summary, key takeaway, and professional sign-off
 
-Use clear language, define terms, give examples. Engage the imaginary audience.
-150-250 words total. Format as continuous speech.""",
+Style: {tone_instruction} Factual and clear. {vocab_instruction}
+Delivery intensity: {intensity}. Target: ~{word_count} words. Continuous speech, no labels.""",
+
+        "lecture": f"""You are a university professor. Deliver an educational lecture.
+
+{ANTI_HALLUCINATION}
+
+{topic_line}
+
+Lecture notes (ONLY use this content):
+---
+{context}
+---
+
+Write for a SINGLE Professor. Required structure:
+INTRO: Hook and topic introduction — what students will learn
+BODY: 2–3 key concepts with explanations and examples from the source
+CONCLUSION: Summary, key takeaway, and closing thought
+
+Style: {tone_instruction} {vocab_instruction}
+Delivery intensity: {intensity}. Target: ~{word_count} words. Engage the audience.""",
     }
 
-    return prompts.get(style, prompts["podcast"])
+    return style_instructions.get(style, style_instructions["podcast"])
 
 
-# ── Script Generation ─────────────────────────────────────────────────────────
+# ── Model Loading & Generation ────────────────────────────────────────────────
 
-def generate_script_with_api(prompt: str, api_key: str = None) -> str:
+def generate_script_with_model(prompt: str, model_id: str) -> str:
     """
-    Generate script using available LLM API.
-    Tries: Together AI → Groq → Hugging Face Inference → fallback template.
+    Generate script using the selected HF model.
+    Models:
+      - Qwen/Qwen3-0.6B                     → no token required
+      - meta-llama/Llama-3.1-8B-Instruct    → requires HF_TOKEN env var
+      - openai-community/gpt2               → no token required
     """
-    # Try Together AI (fast, free tier available)
-    together_key = api_key or os.environ.get("TOGETHER_API_KEY", "")
-    if together_key:
-        try:
-            return _together_generate(prompt, together_key)
-        except Exception as e:
-            print(f"Together AI failed: {e}")
+    hf_token = os.getenv("HF_TOKEN", "").strip() or None
 
-    # Try Groq
-    groq_key = os.environ.get("GROQ_API_KEY", "")
-    if groq_key:
-        try:
-            return _groq_generate(prompt, groq_key)
-        except Exception as e:
-            print(f"Groq failed: {e}")
-
-    # Try HF Inference API
-    hf_token = os.environ.get("HF_TOKEN", "")
-    if hf_token:
-        try:
-            return _hf_generate(prompt, hf_token)
-        except Exception as e:
-            print(f"HF Inference failed: {e}")
-
-    # Final fallback: local transformers
-    return _local_generate(prompt)
-
-
-def _together_generate(prompt: str, api_key: str) -> str:
-    import requests
-    response = requests.post(
-        "https://api.together.xyz/v1/chat/completions",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={
-            "model": "mistralai/Mixtral-8x7B-Instruct-v0.1",
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 600,
-            "temperature": 0.7,
-        },
-        timeout=60,
-    )
-    response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"].strip()
-
-
-def _groq_generate(prompt: str, api_key: str) -> str:
-    import requests
-    response = requests.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={
-            "model": "llama3-8b-8192",
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 600,
-            "temperature": 0.7,
-        },
-        timeout=60,
-    )
-    response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"].strip()
-
-
-def _hf_generate(prompt: str, token: str) -> str:
-    import requests
-    response = requests.post(
-        "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.2",
-        headers={"Authorization": f"Bearer {token}"},
-        json={"inputs": prompt, "parameters": {"max_new_tokens": 600, "temperature": 0.7}},
-        timeout=90,
-    )
-    response.raise_for_status()
-    result = response.json()
-    if isinstance(result, list):
-        return result[0].get("generated_text", prompt)[len(prompt):].strip()
-    return str(result)
-
-
-def _local_generate(prompt: str) -> str:
-    """Fallback: use a small local model via transformers pipeline."""
-    try:
-        from transformers import pipeline
-        generator = pipeline(
-            "text-generation",
-            model="facebook/opt-125m",
-            max_new_tokens=400,
-            do_sample=True,
-            temperature=0.8,
+    if "llama" in model_id.lower() and not hf_token:
+        raise ValueError(
+            "Llama-3.1-8B-Instruct requires a Hugging Face token with gated model access. "
+            "Set HF_TOKEN in your Spaces secrets, or choose Qwen or GPT-2."
         )
-        result = generator(prompt[:1000])[0]["generated_text"]
-        return result[len(prompt):].strip()
+
+    try:
+        return _hf_transformers_generate(prompt, model_id, hf_token)
     except Exception as e:
-        print(f"Local generation failed: {e}")
-        return _template_fallback(prompt)
+        print(f"[{model_id}] Generation failed: {e}")
+        # Fallback to inference API if local fails
+        if hf_token:
+            try:
+                return _hf_inference_api(prompt, model_id, hf_token)
+            except Exception as e2:
+                print(f"[HF Inference API] Also failed: {e2}")
+        raise RuntimeError(
+            f"Script generation failed with {model_id}. "
+            "Try a different model or check your HF_TOKEN."
+        ) from e
 
 
-def _template_fallback(prompt: str) -> str:
-    """Emergency fallback with template-based script."""
-    return """[Host A]: Welcome to today's episode! We're diving into some fascinating material that our listeners have been curious about.
+def _hf_transformers_generate(prompt: str, model_id: str, token: str = None) -> str:
+    """Load model locally and generate text."""
+    from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
+    import torch
 
-[Host B]: That's right! And today's content is particularly interesting because it covers some really important concepts that affect many people.
+    print(f"Loading model: {model_id}")
 
-[Host A]: Let's start from the beginning. Based on our research, the core idea here is about understanding complex systems and how they work together in practice.
+    kwargs = {"token": token} if token else {}
 
-[Host B]: Exactly. And what I find most compelling is how this applies to real-world situations. It's not just theory — these are practical insights.
+    if "gpt2" in model_id.lower():
+        # GPT-2: text-generation pipeline
+        gen = pipeline(
+            "text-generation",
+            model=model_id,
+            max_new_tokens=600,
+            do_sample=True,
+            temperature=0.75,
+            pad_token_id=50256,
+            **kwargs,
+        )
+        out = gen(prompt[:1500])[0]["generated_text"]
+        # Strip the prompt prefix
+        result = out[len(prompt):].strip() if out.startswith(prompt[:100]) else out.strip()
+        return result if result else out
 
-[Host A]: One of the key points we want to highlight is that success in this area requires careful preparation and systematic thinking.
+    else:
+        # Qwen / Llama — chat/instruct style
+        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, **kwargs)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            device_map="auto",
+            trust_remote_code=True,
+            **kwargs,
+        )
+        model.eval()
 
-[Host B]: Well said. And for our listeners just getting started, the most important takeaway is to focus on fundamentals before moving to advanced concepts.
+        # Build chat messages
+        messages = [
+            {"role": "system", "content": "You are a professional audio script writer. Follow all instructions precisely."},
+            {"role": "user", "content": prompt},
+        ]
 
-[Host A]: That wraps up today's episode. Thank you for joining us!
+        # Use chat template if available
+        if hasattr(tokenizer, "apply_chat_template"):
+            input_text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        else:
+            input_text = f"### Instruction:\n{prompt}\n\n### Response:\n"
 
-[Host B]: Until next time, keep learning and stay curious!"""
+        inputs = tokenizer(input_text, return_tensors="pt").to(model.device)
+        max_input = min(inputs["input_ids"].shape[1], 1500)
+        inputs = {k: v[:, :max_input] for k, v in inputs.items()}
+
+        with torch.no_grad():
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=600,
+                do_sample=True,
+                temperature=0.75,
+                top_p=0.9,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+
+        # Decode only new tokens
+        new_tokens = output_ids[0][inputs["input_ids"].shape[1]:]
+        return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+
+
+def _hf_inference_api(prompt: str, model_id: str, token: str) -> str:
+    """Fallback: HuggingFace Inference API."""
+    import requests
+
+    url = f"https://api-inference.huggingface.co/models/{model_id}"
+    headers = {"Authorization": f"Bearer {token}"}
+    payload = {
+        "inputs": prompt[:2000],
+        "parameters": {"max_new_tokens": 600, "temperature": 0.75, "return_full_text": False},
+    }
+    resp = requests.post(url, headers=headers, json=payload, timeout=90)
+    resp.raise_for_status()
+    result = resp.json()
+    if isinstance(result, list) and result:
+        return result[0].get("generated_text", "").strip()
+    return str(result)
 
 
 # ── Script Parsing ────────────────────────────────────────────────────────────
 
 def parse_script_to_segments(script: str, style: str) -> List[Dict]:
     """
-    Parse the generated script into segments for TTS.
-    Returns list of {speaker, text} dicts.
+    Parse the generated script into TTS-ready segments.
+    Returns list of {speaker: str, text: str}.
     """
     segments = []
     config = STYLE_CONFIG.get(style, STYLE_CONFIG["podcast"])
 
     if config["format"] == "dialogue":
-        # Parse [Speaker]: text format
+        # Match [Speaker]: text
         pattern = r'\[([^\]]+)\]:\s*(.+?)(?=\[[^\]]+\]:|$)'
         matches = re.findall(pattern, script, re.DOTALL)
 
         for speaker, text in matches:
             text = text.strip()
-            if text:
+            if text and len(text) > 5:
                 segments.append({"speaker": speaker.strip(), "text": text})
 
-        # If parsing failed, treat as single narrator
+        # Fallback if parsing failed
         if not segments:
-            lines = [l.strip() for l in script.split('\n') if l.strip()]
+            lines = [l.strip() for l in script.split('\n') if l.strip() and len(l.strip()) > 10]
             voices = config["voices"]
             for i, line in enumerate(lines):
-                segments.append({
-                    "speaker": voices[i % len(voices)],
-                    "text": line
-                })
+                segments.append({"speaker": voices[i % len(voices)], "text": line})
+
     else:
         # Monologue: split by paragraphs
-        paragraphs = [p.strip() for p in script.split('\n\n') if p.strip()]
+        paragraphs = [p.strip() for p in script.split('\n\n') if p.strip() and len(p.strip()) > 10]
         narrator = config["voices"][0]
         for para in paragraphs:
-            segments.append({"speaker": narrator, "text": para})
+            # Skip section headers like "INTRO:", "BODY:", "CONCLUSION:"
+            clean = re.sub(r'^(INTRO|BODY|CONCLUSION)\s*:?\s*', '', para, flags=re.IGNORECASE).strip()
+            if clean:
+                segments.append({"speaker": narrator, "text": clean})
 
     return segments
 
 
-import os
+# ── Build simple prompt (backwards compat) ────────────────────────────────────
+
+def build_prompt(style: str, context: str, topic: str = "") -> str:
+    """Simple wrapper kept for backward compatibility."""
+    return build_prompt_with_params(style, context, topic, params={})
