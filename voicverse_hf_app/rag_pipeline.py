@@ -1,12 +1,16 @@
 """
-RAG Pipeline Module for VoiceVerse Sprint
-Handles document ingestion, chunking, embedding, and retrieval.
+RAG Pipeline Module for VoiceVerse
+====================================
+Document ingestion → chunking (~600 tokens, 100 overlap) →
+sentence-transformer embeddings → FAISS index → Top-4 retrieval.
+Anti-hallucination: retrieved content is strictly injected into prompts.
 """
 
 import os
 import re
 import numpy as np
 from typing import List, Tuple, Optional
+
 
 # ── Document Loading ──────────────────────────────────────────────────────────
 
@@ -28,7 +32,6 @@ def load_document(file_path: str) -> str:
             doc.close()
             return text
         except ImportError:
-            # Fallback: pypdf
             from pypdf import PdfReader
             reader = PdfReader(file_path)
             return "\n".join(page.extract_text() or "" for page in reader.pages)
@@ -44,36 +47,29 @@ def load_document(file_path: str) -> str:
 
 # ── Text Chunking ─────────────────────────────────────────────────────────────
 
-def chunk_text(text: str, chunk_size: int = 500, overlap: int = 100) -> List[str]:
+def chunk_text(text: str, chunk_size: int = 600, overlap: int = 100) -> List[str]:
     """
-    Split text into overlapping chunks for better retrieval coverage.
-    Uses sentence-aware splitting to avoid cutting mid-sentence.
+    Split text into overlapping sentence-aware chunks.
+    PRD: ~600 tokens, 100 overlap.
     """
-    # Clean up whitespace
     text = re.sub(r"\s+", " ", text).strip()
 
     if len(text) < chunk_size:
         return [text] if text else []
 
-    # Split on sentence boundaries first
     sentences = re.split(r"(?<=[.!?])\s+", text)
 
     chunks = []
     current_chunk = ""
-    current_len = 0
 
     for sentence in sentences:
-        sentence_len = len(sentence)
-
-        if current_len + sentence_len > chunk_size and current_chunk:
+        if len(current_chunk) + len(sentence) > chunk_size and current_chunk:
             chunks.append(current_chunk.strip())
-            # Keep overlap: take last `overlap` chars
+            # Overlap: carry last `overlap` chars into next chunk
             overlap_text = current_chunk[-overlap:] if len(current_chunk) > overlap else current_chunk
             current_chunk = overlap_text + " " + sentence
-            current_len = len(current_chunk)
         else:
             current_chunk += (" " if current_chunk else "") + sentence
-            current_len += sentence_len + 1
 
     if current_chunk.strip():
         chunks.append(current_chunk.strip())
@@ -81,33 +77,49 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 100) -> List[str
     return chunks
 
 
-# ── Embedding & Retrieval ─────────────────────────────────────────────────────
+# ── FAISS-Based RAG Pipeline ──────────────────────────────────────────────────
 
 class RAGPipeline:
     """
-    Simple but effective RAG pipeline using sentence-transformers for embeddings
-    and cosine similarity for retrieval.
+    RAG pipeline using sentence-transformers + FAISS for fast semantic retrieval.
+    Falls back to keyword matching if FAISS/sentence-transformers unavailable.
     """
 
     def __init__(self):
         self.chunks: List[str] = []
-        self.embeddings: Optional[np.ndarray] = None
-        self.model = None
-        self._load_model()
+        self.index = None          # FAISS index
+        self.embeddings = None     # numpy array (backup)
+        self.embed_model = None
+        self._load_embed_model()
 
-    def _load_model(self):
-        """Load the embedding model (lazy loaded)."""
+    def _load_embed_model(self):
+        """Lazy-load the embedding model."""
         try:
             from sentence_transformers import SentenceTransformer
-            self.model = SentenceTransformer("all-MiniLM-L6-v2")
+            self.embed_model = SentenceTransformer("all-MiniLM-L6-v2")
             print("✅ Embedding model loaded: all-MiniLM-L6-v2")
         except Exception as e:
-            print(f"⚠️ Could not load sentence-transformers: {e}")
-            self.model = None
+            print(f"⚠️ sentence-transformers unavailable: {e}")
+            self.embed_model = None
+
+    def _build_faiss_index(self, embeddings: np.ndarray):
+        """Build or rebuild FAISS flat L2 index."""
+        try:
+            import faiss
+            dim = embeddings.shape[1]
+            index = faiss.IndexFlatL2(dim)
+            # Normalize for cosine similarity
+            faiss.normalize_L2(embeddings)
+            index.add(embeddings)
+            self.index = index
+            print(f"✅ FAISS index built with {index.ntotal} vectors (dim={dim})")
+        except ImportError:
+            print("⚠️ faiss-cpu not available; falling back to numpy cosine similarity")
+            self.index = None
 
     def ingest(self, file_path: str) -> Tuple[int, str]:
         """
-        Ingest a document: load → chunk → embed.
+        Ingest a document: load → chunk → embed → FAISS index.
         Returns (num_chunks, preview_text).
         """
         raw_text = load_document(file_path)
@@ -115,69 +127,66 @@ class RAGPipeline:
         if not raw_text or len(raw_text.strip()) < 50:
             raise ValueError("Document appears empty or too short to process.")
 
-        self.chunks = chunk_text(raw_text, chunk_size=500, overlap=100)
+        # PRD: ~600 token chunks, 100 overlap
+        self.chunks = chunk_text(raw_text, chunk_size=600, overlap=100)
 
         if not self.chunks:
             raise ValueError("No text chunks could be extracted from the document.")
 
-        # Embed chunks
-        if self.model:
-            self.embeddings = self.model.encode(self.chunks, show_progress_bar=False)
+        if self.embed_model:
+            emb = self.embed_model.encode(self.chunks, show_progress_bar=False)
+            self.embeddings = emb.astype("float32")
+            self._build_faiss_index(self.embeddings.copy())
         else:
-            # Fallback: TF-IDF style keyword matching (no ML)
             self.embeddings = None
+            self.index = None
 
         preview = raw_text[:500] + "..." if len(raw_text) > 500 else raw_text
         return len(self.chunks), preview
 
-    def retrieve(self, query: str, top_k: int = 5) -> List[str]:
+    def retrieve(self, query: str, top_k: int = 4) -> List[str]:
         """
-        Retrieve the top-k most relevant chunks for a query.
+        Retrieve top-k most relevant chunks.
+        PRD: Top-4 chunks.
         Falls back to keyword matching if embeddings unavailable.
         """
         if not self.chunks:
-            raise ValueError("No document has been ingested yet. Please upload a document first.")
+            raise ValueError("No document has been ingested yet.")
 
-        if self.model and self.embeddings is not None:
-            return self._semantic_retrieve(query, top_k)
-        else:
-            return self._keyword_retrieve(query, top_k)
+        if self.embed_model and self.embeddings is not None:
+            return self._faiss_retrieve(query, top_k) if self.index else self._cosine_retrieve(query, top_k)
+        return self._keyword_retrieve(query, top_k)
 
-    def _semantic_retrieve(self, query: str, top_k: int) -> List[str]:
-        """Retrieve using cosine similarity on embeddings."""
-        query_emb = self.model.encode([query])
+    def _faiss_retrieve(self, query: str, top_k: int) -> List[str]:
+        """FAISS-based cosine similarity retrieval."""
+        import faiss
+        query_emb = self.embed_model.encode([query]).astype("float32")
+        faiss.normalize_L2(query_emb)
+        distances, indices = self.index.search(query_emb, min(top_k, len(self.chunks)))
+        return [self.chunks[i] for i in indices[0] if i < len(self.chunks)]
 
-        # Cosine similarity
-        norms_chunks = np.linalg.norm(self.embeddings, axis=1, keepdims=True)
-        norms_query = np.linalg.norm(query_emb, axis=1, keepdims=True)
-
-        # Avoid division by zero
-        norms_chunks = np.where(norms_chunks == 0, 1e-8, norms_chunks)
-        norms_query = np.where(norms_query == 0, 1e-8, norms_query)
-
-        normalized_chunks = self.embeddings / norms_chunks
-        normalized_query = query_emb / norms_query
-
-        scores = (normalized_query @ normalized_chunks.T)[0]
-        top_indices = np.argsort(scores)[::-1][:top_k]
-
-        return [self.chunks[i] for i in top_indices]
+    def _cosine_retrieve(self, query: str, top_k: int) -> List[str]:
+        """Numpy cosine similarity fallback."""
+        query_emb = self.embed_model.encode([query])
+        norm_c = np.linalg.norm(self.embeddings, axis=1, keepdims=True)
+        norm_q = np.linalg.norm(query_emb, axis=1, keepdims=True)
+        norm_c = np.where(norm_c == 0, 1e-8, norm_c)
+        norm_q = np.where(norm_q == 0, 1e-8, norm_q)
+        scores = (query_emb / norm_q @ (self.embeddings / norm_c).T)[0]
+        top_idx = np.argsort(scores)[::-1][:top_k]
+        return [self.chunks[i] for i in top_idx]
 
     def _keyword_retrieve(self, query: str, top_k: int) -> List[str]:
-        """Simple keyword-based fallback retrieval."""
+        """Simple keyword overlap fallback."""
         query_words = set(query.lower().split())
-
-        scored = []
-        for chunk in self.chunks:
-            chunk_words = set(chunk.lower().split())
-            score = len(query_words & chunk_words)
-            scored.append((score, chunk))
-
-        scored.sort(reverse=True)
-        return [chunk for _, chunk in scored[:top_k]]
+        scored = sorted(
+            self.chunks,
+            key=lambda c: len(query_words & set(c.lower().split())),
+            reverse=True,
+        )
+        return scored[:top_k]
 
     def get_full_context(self, max_chars: int = 4000) -> str:
-        """Get concatenated chunks up to max_chars for script generation."""
         context = ""
         for chunk in self.chunks:
             if len(context) + len(chunk) > max_chars:
@@ -185,8 +194,8 @@ class RAGPipeline:
             context += chunk + "\n\n"
         return context.strip()
 
-    def retrieve_for_style(self, style: str, top_k: int = 6) -> str:
-        """Retrieve context tailored to the output style."""
+    def retrieve_for_style(self, style: str, top_k: int = 4) -> str:
+        """Retrieve context tailored to the output style (top-4 per PRD)."""
         style_queries = {
             "podcast": "main ideas key points interesting facts discussion topics",
             "debate": "arguments evidence pros cons perspectives viewpoints",

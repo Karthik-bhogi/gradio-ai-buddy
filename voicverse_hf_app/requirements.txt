@@ -1,27 +1,28 @@
-# VoiceVerse Sprint — Requirements
-# Hugging Face Spaces Deployment
+# VoiceVerse — Requirements (Streamlit / Hugging Face Spaces)
 
 # ── UI Framework ──────────────────────────────────────────────────────────────
-gradio>=4.26.0
+streamlit>=1.35.0
 
 # ── Document Processing ────────────────────────────────────────────────────────
 PyMuPDF>=1.24.0          # PDF parsing (fitz)
 pypdf>=4.2.0             # PDF fallback
 python-docx>=1.1.0       # DOCX parsing
 
-# ── RAG: Embeddings & Retrieval ────────────────────────────────────────────────
+# ── RAG: Embeddings & FAISS Retrieval ─────────────────────────────────────────
 sentence-transformers>=3.0.0
+faiss-cpu>=1.7.4         # FAISS vector index (PRD §6.2)
 numpy>=1.24.0
 
-# ── Script Generation ──────────────────────────────────────────────────────────
-requests>=2.31.0         # API calls (Together AI, Groq, HF)
-transformers>=4.40.0     # Local fallback model
+# ── Script Generation — HF Transformers ───────────────────────────────────────
+transformers>=4.40.0
 torch>=2.0.0             # Required by transformers
+accelerate>=0.30.0       # For device_map="auto"
+requests>=2.31.0         # HF Inference API fallback
 
 # ── Voice Generation ───────────────────────────────────────────────────────────
 edge-tts>=6.1.9          # Microsoft Neural TTS (free, no API key)
 gTTS>=2.5.1              # Google TTS fallback
-pydub>=0.25.1            # Audio concatenation
+pydub>=0.25.1            # Audio concatenation + WAV export
 
 # ── Utilities ──────────────────────────────────────────────────────────────────
 aiohttp>=3.9.0           # Async HTTP (used by edge-tts)

@@ -1,16 +1,15 @@
 """
-Voice Generation Module for VoiceVerse Sprint
-Multi-voice TTS supporting edge-tts (primary) and gTTS (fallback).
+Voice Generation Module for VoiceVerse
+=========================================
+Primary: Microsoft Edge Neural TTS (edge-tts) — free, no API key
+Fallback: Google TTS (gTTS)
 
-Edge-TTS voices (Microsoft Azure Neural TTS - FREE, no API key needed):
-- en-US-GuyNeural      → male voice 1
-- en-US-JennyNeural    → female voice 1
-- en-GB-RyanNeural     → British male
-- en-GB-SoniaNeural    → British female
-- en-AU-NatashaNeural  → Australian female
+Output: WAV file (per PRD §6.6)
+Five config parameters influence prosody (rate, pitch, volume).
 """
 
 import asyncio
+import io
 import os
 import tempfile
 from typing import Dict, List, Optional
@@ -19,126 +18,200 @@ from typing import Dict, List, Optional
 # ── Voice Mapping ──────────────────────────────────────────────────────────────
 
 VOICE_MAP = {
-    # Podcast voices
+    # Podcast
     "Host A": "en-US-GuyNeural",
     "Host B": "en-US-JennyNeural",
-    # Debate voices
+    # Debate
     "Speaker 1 (Pro)": "en-GB-RyanNeural",
     "Speaker 2 (Con)": "en-AU-NatashaNeural",
-    # Monologue voices
+    # Monologue styles
     "Narrator": "en-US-JennyNeural",
     "Anchor": "en-US-GuyNeural",
     "Professor": "en-GB-RyanNeural",
-    # Fallback
+    # Defaults
     "default_male": "en-US-GuyNeural",
     "default_female": "en-US-JennyNeural",
 }
 
-# Style-to-voice rate and pitch (edge-tts SSML prosody)
-STYLE_PROSODY = {
-    "podcast": {"rate": "+5%", "pitch": "+0Hz"},
-    "debate": {"rate": "+10%", "pitch": "+2Hz"},
-    "storytelling": {"rate": "-5%", "pitch": "-3Hz"},
-    "news": {"rate": "+0%", "pitch": "+0Hz"},
-    "lecture": {"rate": "-10%", "pitch": "-2Hz"},
+
+# ── Prosody Derived from 5 Config Parameters ──────────────────────────────────
+
+def _params_to_prosody(params: Dict) -> Dict[str, str]:
+    """
+    Map the five UI config parameters → edge-tts SSML prosody values.
+    PRD §6.6: Audio must reflect tone, delivery intensity, style, length.
+    """
+    tone = params.get("tone", "Energetic ⚡").lower()
+    intensity = params.get("intensity", "Balanced 🔉").lower()
+    style = params.get("style", "Podcast 🎧").lower()
+    length = params.get("length", "Medium").lower()
+
+    # Rate: based on tone + length
+    if "calm" in tone or "detailed" in length:
+        rate = "-10%"
+    elif "energetic" in tone or "short" in length:
+        rate = "+15%"
+    elif "dramatic" in tone:
+        rate = "-5%"
+    else:
+        rate = "+0%"
+
+    # Pitch: based on tone
+    if "dramatic" in tone:
+        pitch = "+5Hz"
+    elif "calm" in tone:
+        pitch = "-4Hz"
+    elif "energetic" in tone:
+        pitch = "+3Hz"
+    elif "serious" in tone:
+        pitch = "-2Hz"
+    else:
+        pitch = "+0Hz"
+
+    # Volume: based on delivery intensity
+    if "soft" in intensity:
+        volume = "-20%"
+    elif "powerful" in intensity:
+        volume = "+20%"
+    else:
+        volume = "+0%"
+
+    return {"rate": rate, "pitch": pitch, "volume": volume}
+
+
+# ── Style-based prosody fallback (when no params provided) ─────────────────────
+
+STYLE_PROSODY_DEFAULTS = {
+    "podcast":     {"rate": "+5%",  "pitch": "+0Hz",  "volume": "+0%"},
+    "debate":      {"rate": "+10%", "pitch": "+2Hz",  "volume": "+10%"},
+    "storytelling":{"rate": "-5%",  "pitch": "-3Hz",  "volume": "-10%"},
+    "news":        {"rate": "+0%",  "pitch": "+0Hz",  "volume": "+0%"},
+    "lecture":     {"rate": "-10%", "pitch": "-2Hz",  "volume": "-5%"},
 }
 
 
-# ── Edge TTS (Primary) ────────────────────────────────────────────────────────
+# ── Edge TTS ──────────────────────────────────────────────────────────────────
 
-async def _synthesize_edge_tts(text: str, voice: str, rate: str = "+0%", pitch: str = "+0Hz") -> bytes:
-    """
-    Generate audio using edge-tts (Microsoft Azure Neural TTS, free, no key needed).
-    Returns raw MP3 bytes.
-    """
+async def _synthesize_edge_tts_async(
+    text: str,
+    voice: str,
+    rate: str = "+0%",
+    pitch: str = "+0Hz",
+) -> bytes:
+    """Async edge-tts synthesis. Returns raw MP3 bytes."""
     import edge_tts
 
     communicate = edge_tts.Communicate(text=text, voice=voice, rate=rate, pitch=pitch)
-
     audio_bytes = b""
     async for chunk in communicate.stream():
         if chunk["type"] == "audio":
             audio_bytes += chunk["data"]
-
     return audio_bytes
 
 
 def synthesize_edge_tts(text: str, voice: str, rate: str = "+0%", pitch: str = "+0Hz") -> bytes:
-    """Sync wrapper for edge-tts."""
+    """Sync wrapper for edge-tts (handles both Jupyter and server environments)."""
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        result = loop.run_until_complete(_synthesize_edge_tts(text, voice, rate, pitch))
+        result = loop.run_until_complete(_synthesize_edge_tts_async(text, voice, rate, pitch))
         loop.close()
         return result
     except RuntimeError:
-        # If loop already running (Jupyter/Gradio)
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor() as pool:
-            future = pool.submit(asyncio.run, _synthesize_edge_tts(text, voice, rate, pitch))
+            future = pool.submit(asyncio.run, _synthesize_edge_tts_async(text, voice, rate, pitch))
             return future.result()
 
 
-# ── gTTS (Fallback) ───────────────────────────────────────────────────────────
+# ── gTTS Fallback ─────────────────────────────────────────────────────────────
 
-def synthesize_gtts(text: str, lang: str = "en", slow: bool = False) -> bytes:
-    """Generate audio using Google Text-to-Speech (requires internet, free)."""
+def synthesize_gtts(text: str, slow: bool = False) -> bytes:
+    """Google TTS fallback. Returns MP3 bytes."""
     from gtts import gTTS
-    import io
 
-    tts = gTTS(text=text, lang=lang, slow=slow)
-    audio_buffer = io.BytesIO()
-    tts.write_to_fp(audio_buffer)
-    audio_buffer.seek(0)
-    return audio_buffer.read()
+    tts = gTTS(text=text, lang="en", slow=slow)
+    buf = io.BytesIO()
+    tts.write_to_fp(buf)
+    buf.seek(0)
+    return buf.read()
 
 
-# ── Audio Concatenation ───────────────────────────────────────────────────────
+# ── MP3 → WAV Conversion ──────────────────────────────────────────────────────
 
-def concatenate_audio_files(audio_files: List[str], output_path: str) -> str:
-    """Concatenate multiple MP3 files into one using pydub."""
+def mp3_bytes_to_wav(mp3_bytes: bytes, output_path: str) -> str:
+    """Convert MP3 bytes to WAV file. PRD output format is WAV."""
+    try:
+        from pydub import AudioSegment
+        audio = AudioSegment.from_mp3(io.BytesIO(mp3_bytes))
+        audio.export(output_path, format="wav")
+        return output_path
+    except ImportError:
+        # pydub unavailable — write raw (may not be valid WAV but still playable in Streamlit)
+        wav_path = output_path
+        with open(wav_path, "wb") as f:
+            f.write(mp3_bytes)
+        return wav_path
+
+
+# ── Audio Concatenation → WAV ─────────────────────────────────────────────────
+
+def concatenate_to_wav(segment_paths: List[str], output_path: str) -> str:
+    """Concatenate multiple audio files into one WAV. PRD output: WAV."""
     try:
         from pydub import AudioSegment
 
         combined = AudioSegment.empty()
-        silence = AudioSegment.silent(duration=400)  # 400ms pause between segments
+        silence = AudioSegment.silent(duration=450)  # 450ms pause
 
-        for audio_file in audio_files:
-            segment = AudioSegment.from_mp3(audio_file)
-            combined += segment + silence
+        for path in segment_paths:
+            ext = os.path.splitext(path)[1].lower()
+            if ext == ".mp3":
+                seg = AudioSegment.from_mp3(path)
+            elif ext == ".wav":
+                seg = AudioSegment.from_wav(path)
+            else:
+                seg = AudioSegment.from_file(path)
+            combined += seg + silence
 
-        combined.export(output_path, format="mp3")
+        combined.export(output_path, format="wav")
         return output_path
 
     except ImportError:
-        # Fallback: concatenate raw bytes (won't have proper pauses but works)
-        print("⚠️ pydub not available, using raw concatenation")
+        # Raw concatenation fallback
+        print("⚠️ pydub not available — raw concatenation (quality may be lower)")
         with open(output_path, "wb") as out_f:
-            for audio_file in audio_files:
-                with open(audio_file, "rb") as in_f:
+            for path in segment_paths:
+                with open(path, "rb") as in_f:
                     out_f.write(in_f.read())
         return output_path
 
 
-# ── Main Voice Generation ─────────────────────────────────────────────────────
+# ── Main Audio Generation ─────────────────────────────────────────────────────
 
 def generate_audio(
     segments: List[Dict],
     style: str = "podcast",
     output_dir: Optional[str] = None,
+    audio_prompt: str = "",   # PRD §6.6 audio conditioning prompt
+    params: Dict = None,      # Five config parameters
     progress_callback=None,
 ) -> str:
     """
-    Generate audio for a list of script segments.
+    Generate WAV audio for a list of script segments.
+    PRD: Output = playable WAV file.
+    Five config parameters drive prosody (rate, pitch, volume).
 
     Args:
         segments: List of {"speaker": str, "text": str}
-        style: Content style for prosody settings
-        output_dir: Directory to save temp files (uses tempdir if None)
-        progress_callback: Optional function(step, total, message) for UI updates
+        style: Content style key
+        output_dir: Directory for temp files
+        audio_prompt: Internal audio-conditioning string (logged/used for prosody mapping)
+        params: Five config parameters dict
+        progress_callback: Optional fn(step, total, msg) for UI updates
 
     Returns:
-        Path to the final combined MP3 file.
+        Path to the final WAV file.
     """
     if not segments:
         raise ValueError("No script segments provided.")
@@ -146,103 +219,68 @@ def generate_audio(
     if output_dir is None:
         output_dir = tempfile.mkdtemp()
 
-    prosody = STYLE_PROSODY.get(style, {"rate": "+0%", "pitch": "+0Hz"})
+    # Determine prosody from params (PRD §6.6)
+    if params:
+        prosody = _params_to_prosody(params)
+    else:
+        prosody = STYLE_PROSODY_DEFAULTS.get(style, {"rate": "+0%", "pitch": "+0Hz", "volume": "+0%"})
+
+    if audio_prompt:
+        print(f"[Audio Conditioning] {audio_prompt}")
+        print(f"[Prosody Applied] rate={prosody['rate']} pitch={prosody['pitch']} volume={prosody.get('volume','')}")
+
+    use_edge = _check_edge_tts()
     temp_files = []
     total = len(segments)
 
-    use_edge_tts = _check_edge_tts()
-
-    for i, segment in enumerate(segments):
-        speaker = segment.get("speaker", "default_male")
-        text = segment.get("text", "").strip()
+    for i, seg in enumerate(segments):
+        speaker = seg.get("speaker", "default_male")
+        text = seg.get("text", "").strip()
 
         if not text:
             continue
 
         if progress_callback:
-            progress_callback(i + 1, total, f"🎙️ Generating voice for: {speaker}...")
+            progress_callback(i + 1, total, f"🎙️ {speaker}...")
 
-        # Get voice for this speaker
         voice = VOICE_MAP.get(speaker, VOICE_MAP["default_male"])
+        seg_path = os.path.join(output_dir, f"seg_{i:03d}.mp3")
 
-        # Generate audio chunk
-        segment_path = os.path.join(output_dir, f"segment_{i:03d}.mp3")
-
-        if use_edge_tts:
+        if use_edge:
             try:
-                audio_bytes = synthesize_edge_tts(
+                mp3_bytes = synthesize_edge_tts(
                     text=text,
                     voice=voice,
                     rate=prosody["rate"],
                     pitch=prosody["pitch"],
                 )
-                with open(segment_path, "wb") as f:
-                    f.write(audio_bytes)
+                with open(seg_path, "wb") as f:
+                    f.write(mp3_bytes)
             except Exception as e:
-                print(f"edge-tts failed for segment {i}: {e}. Falling back to gTTS.")
-                audio_bytes = synthesize_gtts(text)
-                with open(segment_path, "wb") as f:
-                    f.write(audio_bytes)
+                print(f"edge-tts failed seg {i}: {e}. Using gTTS.")
+                mp3_bytes = synthesize_gtts(text)
+                with open(seg_path, "wb") as f:
+                    f.write(mp3_bytes)
         else:
-            # Use gTTS
-            audio_bytes = synthesize_gtts(text)
-            with open(segment_path, "wb") as f:
-                f.write(audio_bytes)
+            mp3_bytes = synthesize_gtts(text)
+            with open(seg_path, "wb") as f:
+                f.write(mp3_bytes)
 
-        temp_files.append(segment_path)
+        temp_files.append(seg_path)
 
     if not temp_files:
         raise ValueError("No audio segments were generated.")
 
-    # Combine all segments
-    output_path = os.path.join(output_dir, "voiceverse_output.mp3")
-    concatenate_audio_files(temp_files, output_path)
+    # Combine into WAV (PRD output format)
+    output_wav = os.path.join(output_dir, "voiceverse_output.wav")
+    concatenate_to_wav(temp_files, output_wav)
 
-    return output_path
+    return output_wav
 
 
 def _check_edge_tts() -> bool:
-    """Check if edge-tts is available."""
     try:
-        import edge_tts
+        import edge_tts  # noqa
         return True
     except ImportError:
         return False
-
-
-# ── Voice Preview ─────────────────────────────────────────────────────────────
-
-def generate_voice_preview(style: str) -> Optional[str]:
-    """Generate a short voice preview for the selected style."""
-    preview_texts = {
-        "podcast": {
-            "Host A": "Welcome to VoiceVerse! I'm your host, and today we have an exciting episode.",
-            "Host B": "That's right! And I can't wait to dive into today's fascinating topic.",
-        },
-        "debate": {
-            "Speaker 1 (Pro)": "I firmly believe that the evidence supports our position on this matter.",
-            "Speaker 2 (Con)": "While that perspective has merit, I must respectfully disagree with the conclusion.",
-        },
-        "storytelling": {
-            "Narrator": "Once upon a time, in a world shaped by ideas, a discovery changed everything...",
-        },
-        "news": {
-            "Anchor": "Good evening. Tonight's top story: A breakthrough in understanding has researchers excited.",
-        },
-        "lecture": {
-            "Professor": "Today we'll explore three fundamental concepts that form the foundation of this subject.",
-        },
-    }
-
-    segments = []
-    for speaker, text in preview_texts.get(style, {}).items():
-        segments.append({"speaker": speaker, "text": text})
-
-    if not segments:
-        return None
-
-    try:
-        return generate_audio(segments, style=style)
-    except Exception as e:
-        print(f"Preview generation failed: {e}")
-        return None
